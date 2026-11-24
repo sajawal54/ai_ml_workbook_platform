@@ -324,15 +324,63 @@ function validateRunInputs(dataset, featureColumns, targetColumn, category) {
           )
       );
     if (values.length === 0) {
-      return `Feature column '${column}' has no numeric values.`;
+      return `Feature column '${column}' has no usable values.`;
     }
+    const numericValues = values.map((value) =>
+      typeof value === "number" ? value : Number(value)
+    );
     if (
-      values.some((value) => {
-        const numeric = typeof value === "number" ? value : Number(value);
-        return !Number.isFinite(numeric);
-      })
+      numericValues.some(
+        (value) => !Number.isNaN(value) && !Number.isFinite(value)
+      )
     ) {
-      return `Feature column '${column}' contains non-numeric or non-finite values.`;
+      return `Feature column '${column}' contains non-finite numeric values.`;
+    }
+    const normalizedName = column
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "");
+    const isIdentifier =
+      ["id", "identifier", "uuid"].includes(normalizedName) ||
+      normalizedName.endsWith("_id") ||
+      normalizedName.endsWith("_identifier") ||
+      normalizedName.endsWith("_uuid");
+    if (isIdentifier) {
+      return `Feature column '${column}' appears to be an ID. Remove identifiers from Input Features.`;
+    }
+
+    if (!numericValues.every(Number.isFinite)) {
+      const categories = values.map((value) => String(value).trim());
+      const uniqueValues = new Set(categories);
+      const mostlyUnique =
+        uniqueValues.size >= 5 && uniqueValues.size / categories.length > 0.8;
+      const longText = categories.some((value) => value.length > 80);
+      const textNameHints = new Set([
+        "address",
+        "comment",
+        "description",
+        "email",
+        "free",
+        "name",
+        "note",
+        "phone",
+        "review",
+        "street",
+        "text",
+        "url",
+      ]);
+      const isFreeTextName = normalizedName
+        .split("_")
+        .some((part) => textNameHints.has(part));
+      if (
+        uniqueValues.size > 10 ||
+        mostlyUnique ||
+        longText ||
+        isFreeTextName
+      ) {
+        return `Feature column '${column}' looks like high-cardinality text or an ID. Remove it or select categories with 10 or fewer short values.`;
+      }
     }
   }
 

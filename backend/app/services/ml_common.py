@@ -1,14 +1,45 @@
 from typing import Any
+import re
 
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 
+
+__all__ = [
+    "_build_feature_preprocessor",
+    "_compute_roc_details",
+    "_display_feature_values",
+    "_extract_feature_frame",
+    "_format_feature_row",
+    "_is_missing",
+    "_numeric_param",
+    "_project_2d",
+    "_resolve_task",
+]
 
 _MISSING_VALUES = {"", "na", "nan", "null", "none"}
+_MAX_CATEGORICAL_VALUES = 10
+_MAX_CATEGORY_TEXT_LENGTH = 80
+_TEXT_COLUMN_HINTS = {
+    "address",
+    "comment",
+    "description",
+    "email",
+    "free_text",
+    "name",
+    "note",
+    "phone",
+    "review",
+    "street",
+    "text",
+    "url",
+}
 
 
 def _is_missing(series: pd.Series) -> pd.Series:
@@ -42,15 +73,30 @@ def _format_numeric_label(value: float) -> str:
     return str(value)
 
 
-def _extract_numeric_features(
+def _is_identifier_column(column: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", column.strip().lower()).strip("_")
+    return (
+        normalized in {"id", "identifier", "uuid"}
+        or normalized.endswith(("_id", "_identifier", "_uuid"))
+    )
+
+
+def _is_free_text_column(column: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", column.strip().lower()).strip("_")
+    return bool(set(normalized.split("_")) & _TEXT_COLUMN_HINTS)
+
+
+def _extract_feature_frame(
     df: pd.DataFrame, feature_columns: list[str]
-) -> np.ndarray:
+) -> tuple[pd.DataFrame, list[str], list[str]]:
     if not feature_columns:
-        raise ValueError("Select at least one numeric feature column.")
+        raise ValueError("Select at least one numeric or categorical feature.")
     if len(set(feature_columns)) != len(feature_columns):
         raise ValueError("Feature columns must be unique.")
 
-    feature_frames: list[pd.Series] = []
+    feature_frame = pd.DataFrame(index=df.index)
+    numeric_columns: list[str] = []
+    categorical_columns: list[str] = []
     for col in feature_columns:
         if col not in df.columns:
             raise ValueError(f"Column '{col}' was not found in the dataset.")
@@ -58,27 +104,140 @@ def _extract_numeric_features(
         present = raw[~_is_missing(raw)]
         if present.empty:
             raise ValueError(
-                f"Feature column '{col}' has no numeric values. Remove it or provide data."
+                f"Feature column '{col}' has no usable values. Remove it or provide data."
             )
         parsed = pd.to_numeric(present, errors="coerce")
-        numeric_values = parsed.to_numpy(dtype=float)
-        invalid = parsed.isna().to_numpy() | ~np.isfinite(numeric_values)
-        if invalid.any():
-            samples = (
-                present.iloc[np.flatnonzero(invalid)]
-                .astype(str)
-                .unique()[:3]
-                .tolist()
-            )
+        parsed_values = parsed.dropna().to_numpy(dtype=float)
+        if not np.isfinite(parsed_values).all():
             raise ValueError(
-                f"Feature column '{col}' has non-numeric or non-finite values ({samples}). Use finite numeric values."
+                f"Feature column '{col}' contains non-finite numbers. Use finite numeric values."
             )
-        numeric_col = pd.to_numeric(raw.mask(_is_missing(raw)), errors="coerce")
-        feature_frames.append(numeric_col)
+        if parsed.notna().all():
+            if _is_identifier_column(col):
+                raise ValueError(
+                    f"Feature column '{col}' appears to be an identifier. Remove ID columns from Input Features."
+                )
+            feature_frame[col] = pd.to_numeric(
+                raw.mask(_is_missing(raw)), errors="coerce"
+            )
+            numeric_columns.append(col)
+            continue
 
-    X_df = pd.concat(feature_frames, axis=1)
-    X_df.columns = feature_columns
-    return X_df.to_numpy(dtype=float)
+        categories = present.astype(str).str.strip()
+        unique_count = int(categories.nunique())
+        too_many_values = unique_count > _MAX_CATEGORICAL_VALUES
+        mostly_unique = (
+            unique_count >= 5 and unique_count / len(categories) > 0.8
+        )
+        long_text = any(
+            len(value) > _MAX_CATEGORY_TEXT_LENGTH for value in categories
+        )
+        if (
+            too_many_values
+            or mostly_unique
+            or long_text
+            or _is_identifier_column(col)
+            or _is_free_text_column(col)
+        ):
+            raise ValueError(
+                f"Feature column '{col}' looks like high-cardinality text or an ID and cannot be safely encoded. "
+                "Remove it or use numeric features and categorical columns with 10 or fewer short values."
+            )
+
+        feature_frame[col] = raw.mask(_is_missing(raw)).map(
+            lambda value: str(value).strip() if pd.notna(value) else np.nan
+        )
+        categorical_columns.append(col)
+
+    return feature_frame.loc[:, feature_columns], numeric_columns, categorical_columns
+
+
+def _build_feature_preprocessor(
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+    scale_features: bool,
+) -> ColumnTransformer:
+    transformers: list[tuple[str, Pipeline, list[str]]] = []
+    if numeric_columns:
+        numeric_steps: list[tuple[str, Any]] = [
+            ("imputer", SimpleImputer(strategy="median"))
+        ]
+        if scale_features:
+            numeric_steps.append(("scaler", StandardScaler()))
+        transformers.append(
+            ("numeric", Pipeline(numeric_steps), numeric_columns)
+        )
+    if categorical_columns:
+        categorical_pipeline = Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                (
+                    "onehot",
+                    OneHotEncoder(
+                        handle_unknown="ignore",
+                        sparse_output=False,
+                    ),
+                ),
+            ]
+        )
+        transformers.append(
+            ("categorical", categorical_pipeline, categorical_columns)
+        )
+    return ColumnTransformer(
+        transformers,
+        remainder="drop",
+        sparse_threshold=0.0,
+        verbose_feature_names_out=False,
+    )
+
+
+def _display_feature_values(
+    feature_frame: pd.DataFrame,
+    preprocessor: ColumnTransformer,
+    feature_columns: list[str],
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+    *,
+    scale_numeric: bool,
+) -> np.ndarray:
+    display_values = np.empty(
+        (len(feature_frame), len(feature_columns)), dtype=object
+    )
+    column_positions = {
+        column: index for index, column in enumerate(feature_columns)
+    }
+
+    if numeric_columns:
+        numeric_pipeline = preprocessor.named_transformers_["numeric"]
+        if scale_numeric:
+            numeric_values = numeric_pipeline.transform(
+                feature_frame.loc[:, numeric_columns]
+            )
+        else:
+            numeric_values = numeric_pipeline.named_steps["imputer"].transform(
+                feature_frame.loc[:, numeric_columns]
+            )
+        for index, column in enumerate(numeric_columns):
+            display_values[:, column_positions[column]] = numeric_values[:, index]
+
+    if categorical_columns:
+        categorical_pipeline = preprocessor.named_transformers_["categorical"]
+        categorical_values = categorical_pipeline.named_steps["imputer"].transform(
+            feature_frame.loc[:, categorical_columns]
+        )
+        for index, column in enumerate(categorical_columns):
+            display_values[:, column_positions[column]] = categorical_values[:, index]
+
+    return display_values
+
+
+def _format_feature_row(values: np.ndarray) -> list[Any]:
+    return [
+        round(float(value), 4)
+        if isinstance(value, (int, float, np.number))
+        else str(value)
+        for value in values
+    ]
 
 
 def _project_2d(X: np.ndarray, labels: list[str]) -> list[dict[str, Any]]:

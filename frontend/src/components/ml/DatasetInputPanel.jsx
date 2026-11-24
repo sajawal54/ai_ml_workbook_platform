@@ -1,5 +1,45 @@
 import { Upload, Plus, Trash2, AlertTriangle } from "lucide-react";
 
+const MAX_CATEGORICAL_VALUES = 10;
+const MAX_CATEGORY_TEXT_LENGTH = 80;
+const TEXT_COLUMN_HINTS = new Set([
+  "address",
+  "comment",
+  "description",
+  "email",
+  "free_text",
+  "name",
+  "note",
+  "phone",
+  "review",
+  "street",
+  "text",
+  "url",
+]);
+
+function isIdentifierColumn(column) {
+  const normalized = column
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+  return (
+    ["id", "identifier", "uuid"].includes(normalized) ||
+    normalized.endsWith("_id") ||
+    normalized.endsWith("_identifier") ||
+    normalized.endsWith("_uuid")
+  );
+}
+
+function isFreeTextColumn(column) {
+  const normalized = column
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+  return normalized.split("_").some((part) => TEXT_COLUMN_HINTS.has(part));
+}
+
 function detectDelimiter(text) {
   const counts = { ",": 0, ";": 0, "\t": 0 };
   let quoted = false;
@@ -124,16 +164,48 @@ function parseCsvText(text) {
   return { columns, rows };
 }
 
-function isNumericColumn(rows, colIdx) {
-  const nonEmpty = rows
-    .map((r) => r[colIdx])
-    .filter((v) => v !== null && v !== undefined && String(v).trim() !== "");
-  if (nonEmpty.length === 0) return false;
-  return nonEmpty.every((v) => typeof v === "number" && Number.isFinite(v));
-}
+function getFeatureKind(rows, colIdx, column) {
+  const values = rows
+    .map((row) => row[colIdx])
+    .filter(
+      (value) =>
+        value !== null &&
+        value !== undefined &&
+        String(value).trim() !== "" &&
+        !["na", "nan", "null", "none"].includes(
+          String(value).trim().toLowerCase()
+        )
+    );
+  if (values.length === 0) return "empty";
+  if (isIdentifierColumn(column)) return "text";
 
-function detectNumericColumns(columns, rows) {
-  return columns.filter((_, colIdx) => isNumericColumn(rows, colIdx));
+  const hasNonFiniteNumber = values.some((value) => {
+    const numeric = typeof value === "number" ? value : Number(value);
+    return !Number.isNaN(numeric) && !Number.isFinite(numeric);
+  });
+  if (hasNonFiniteNumber) return "text";
+  if (values.every((value) => {
+    const numeric = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(numeric);
+  })) {
+    return "numeric";
+  }
+
+  const categories = values.map((value) => String(value).trim());
+  const uniqueCount = new Set(categories).size;
+  const mostlyUnique = uniqueCount >= 5 && uniqueCount / categories.length > 0.8;
+  const longText = categories.some(
+    (category) => category.length > MAX_CATEGORY_TEXT_LENGTH
+  );
+  if (
+    uniqueCount > MAX_CATEGORICAL_VALUES ||
+    mostlyUnique ||
+    longText ||
+    isFreeTextColumn(column)
+  ) {
+    return "text";
+  }
+  return "categorical";
 }
 
 export default function DatasetInputPanel({
@@ -151,12 +223,18 @@ export default function DatasetInputPanel({
   onChangeScaleFeatures,
   onCsvError,
 }) {
-  const nonNumericColumns = dataset.columns.filter(
-    (_, idx) => !isNumericColumn(dataset.rows, idx)
+  const columnKinds = dataset.columns.map((column, idx) =>
+    getFeatureKind(dataset.rows, idx, column)
   );
-  const selectedNonNumericFeatures = featureColumns.filter((col) => {
+  const unsupportedColumns = dataset.columns.filter(
+    (_, idx) => columnKinds[idx] === "text"
+  );
+  const categoricalColumns = dataset.columns.filter(
+    (_, idx) => columnKinds[idx] === "categorical"
+  );
+  const selectedUnsupportedFeatures = featureColumns.filter((col) => {
     const idx = dataset.columns.indexOf(col);
-    return idx >= 0 && !isNumericColumn(dataset.rows, idx);
+    return idx >= 0 && columnKinds[idx] === "text";
   });
 
   const handleCsvFile = async (e) => {
@@ -168,14 +246,21 @@ export default function DatasetInputPanel({
       onCsvError("");
       onChangeDataset(parsed);
 
-      const numericCols = detectNumericColumns(parsed.columns, parsed.rows);
       const suggestedTarget = parsed.columns[parsed.columns.length - 1] || "";
-      let cleanFeatures = numericCols.filter((c) => c !== suggestedTarget);
-      if (cleanFeatures.length === 0) {
-        cleanFeatures = parsed.columns.filter((c) => c !== suggestedTarget);
-      }
-      if (parsed.columns.length === 1 && numericCols.length === 1) {
-        cleanFeatures = numericCols;
+      const cleanFeatures = parsed.columns.filter((column, idx) => {
+        const kind = getFeatureKind(parsed.rows, idx, column);
+        return (
+          column !== suggestedTarget &&
+          (kind === "numeric" || kind === "categorical")
+        );
+      });
+      if (
+        parsed.columns.length === 1 &&
+        ["numeric", "categorical"].includes(
+          getFeatureKind(parsed.rows, 0, parsed.columns[0])
+        )
+      ) {
+        cleanFeatures.push(suggestedTarget);
       }
       onChangeFeatureColumns(cleanFeatures);
       onChangeTargetColumn(suggestedTarget);
@@ -258,7 +343,7 @@ export default function DatasetInputPanel({
             Upload CSV or Edit Table Values
           </h3>
           <p className="text-xs text-slate-400 mt-0.5">
-            Models expect numeric values for selected Input Features. Non-numeric CSV columns are skipped automatically when choosing features.
+            Numeric and low-cardinality categorical features are supported; high-cardinality text and ID columns are excluded.
           </p>
         </div>
 
@@ -294,32 +379,36 @@ export default function DatasetInputPanel({
         </div>
       </div>
 
-      {/* Numeric Data Notice / Warning */}
+      {/* Feature Data Notice / Warning */}
       <div className="rounded-xl bg-amber-500/10 border border-amber-500/30 px-4 py-3 text-xs text-amber-200 flex items-start gap-2.5">
         <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
         <div className="space-y-1">
           <p className="font-semibold text-amber-300">
-            Numeric Input Requirement: Selected feature columns must contain numeric data.
+            Features support numbers or categories with up to 10 values.
           </p>
-          {selectedNonNumericFeatures.length > 0 ? (
+          {selectedUnsupportedFeatures.length > 0 ? (
             <p>
-              Warning: Selected feature column(s) with non-numeric values:{" "}
+              Remove high-cardinality text/ID feature(s):{" "}
               <span className="font-mono font-semibold text-white">
-                {selectedNonNumericFeatures.join(", ")}
+                {selectedUnsupportedFeatures.join(", ")}
               </span>
-              . Unselect them or replace values with numbers before running.
+              .
             </p>
-          ) : nonNumericColumns.length > 0 ? (
+          ) : unsupportedColumns.length > 0 ? (
             <p>
-              Non-numeric column(s) detected:{" "}
+              High-cardinality text/ID columns are not encoded:{" "}
               <span className="font-mono text-amber-100">
-                {nonNumericColumns.join(", ")}
+                {unsupportedColumns.join(", ")}
               </span>
-              . Keep them unselected as features (or use as a classification target).
+              . Low-cardinality categories are one-hot encoded.
+            </p>
+          ) : categoricalColumns.length > 0 ? (
+            <p className="text-amber-200/80">
+              Low-cardinality categorical features are one-hot encoded.
             </p>
           ) : (
             <p className="text-amber-200/80">
-              All current columns look numeric. Avoid typing text into feature cells.
+              All current feature columns look numeric.
             </p>
           )}
         </div>
@@ -332,12 +421,12 @@ export default function DatasetInputPanel({
             Input Columns (Features)
           </p>
           <p className="text-[11px] text-slate-400 mb-2">
-            Select numeric columns only (unselect the target column).
+            Select numeric or low-cardinality categorical columns (unselect the target).
           </p>
           <div className="flex flex-wrap gap-1.5">
             {dataset.columns.map((col, idx) => {
               const active = featureColumns.includes(col);
-              const numeric = isNumericColumn(dataset.rows, idx);
+              const kind = columnKinds[idx];
               return (
                 <button
                   key={col}
@@ -352,12 +441,18 @@ export default function DatasetInputPanel({
                   <span>{col}</span>
                   <span
                     className={`text-[10px] px-1.5 py-0.2 rounded font-mono ${
-                      numeric
+                      kind === "numeric"
                         ? "bg-emerald-500/15 text-emerald-300"
+                        : kind === "categorical"
+                        ? "bg-sky-500/15 text-sky-300"
                         : "bg-amber-500/15 text-amber-300"
                     }`}
                   >
-                    {numeric ? "num" : "text"}
+                    {kind === "numeric"
+                      ? "num"
+                      : kind === "categorical"
+                      ? "cat"
+                      : "text"}
                   </span>
                 </button>
               );

@@ -5,13 +5,13 @@ import pandas as pd
 from sklearn.cluster import AgglomerativeClustering, DBSCAN, KMeans
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import silhouette_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from app.services.ml_common import (
-    _extract_numeric_features,
+    _build_feature_preprocessor,
+    _display_feature_values,
+    _extract_feature_frame,
+    _format_feature_row,
     _numeric_param,
     _project_2d,
 )
@@ -26,19 +26,25 @@ def run_unsupervised(
     params: dict[str, Any],
 ) -> dict[str, Any]:
     df = pd.DataFrame(rows, columns=columns)
-    X_raw = _extract_numeric_features(df, feature_columns)
+    X_raw, numeric_columns, categorical_columns = _extract_feature_frame(
+        df, feature_columns
+    )
 
     if len(X_raw) < 4:
         raise ValueError("At least 4 rows are required for unsupervised analysis.")
 
-    prep_steps: list[tuple[str, Any]] = [
-        ("imputer", SimpleImputer(strategy="median"))
-    ]
-    if scale_features:
-        prep_steps.append(("scaler", StandardScaler()))
-
-    X_proc = Pipeline(prep_steps).fit_transform(X_raw)
-    X_imp = SimpleImputer(strategy="median").fit_transform(X_raw)
+    preprocessor = _build_feature_preprocessor(
+        numeric_columns, categorical_columns, scale_features
+    )
+    X_proc = preprocessor.fit_transform(X_raw)
+    X_display = _display_feature_values(
+        X_raw,
+        preprocessor,
+        feature_columns,
+        numeric_columns,
+        categorical_columns,
+        scale_numeric=False,
+    )
 
     metrics: dict[str, Any] = {"rows_analyzed": int(len(X_proc))}
     labels_for_chart: list[str] = []
@@ -72,8 +78,8 @@ def run_unsupervised(
         labels_for_chart = [f"Cluster {c}" for c in clusters]
         table_headers.append("Cluster")
         table_rows = [
-            [i + 1, *[round(float(v), 4) for v in X_imp[i]], int(clusters[i])]
-            for i in range(len(X_imp))
+            [i + 1, *_format_feature_row(X_display[i]), int(clusters[i])]
+            for i in range(len(X_display))
         ]
     elif algorithm == "dbscan":
         eps = float(_numeric_param(params, "eps", 0.9))
@@ -99,8 +105,8 @@ def run_unsupervised(
         ]
         table_headers.append("Cluster (-1 = Noise)")
         table_rows = [
-            [i + 1, *[round(float(v), 4) for v in X_imp[i]], int(clusters[i])]
-            for i in range(len(X_imp))
+            [i + 1, *_format_feature_row(X_display[i]), int(clusters[i])]
+            for i in range(len(X_display))
         ]
     elif algorithm == "hierarchical":
         requested_clusters = int(
@@ -121,8 +127,8 @@ def run_unsupervised(
         labels_for_chart = [f"Cluster {c}" for c in clusters]
         table_headers.append("Cluster")
         table_rows = [
-            [i + 1, *[round(float(v), 4) for v in X_imp[i]], int(clusters[i])]
-            for i in range(len(X_imp))
+            [i + 1, *_format_feature_row(X_display[i]), int(clusters[i])]
+            for i in range(len(X_display))
         ]
     elif algorithm == "pca":
         max_comp = min(len(X_proc), X_proc.shape[1])
@@ -150,13 +156,14 @@ def run_unsupervised(
         table_rows = [
             [
                 i + 1,
-                *[round(float(v), 4) for v in X_imp[i]],
+                *_format_feature_row(X_display[i]),
                 *[round(float(c), 4) for c in projected[i]],
             ]
-            for i in range(len(X_imp))
+            for i in range(len(X_display))
         ]
         labels_for_chart = [
-            f"PC1={round(float(projected[i, 0]), 2)}" for i in range(len(X_imp))
+            f"PC1={round(float(projected[i, 0]), 2)}"
+            for i in range(len(X_display))
         ]
     elif algorithm == "isolation_forest":
         n_est = int(
@@ -191,11 +198,11 @@ def run_unsupervised(
         table_rows = [
             [
                 i + 1,
-                *[round(float(v), 4) for v in X_imp[i]],
+                *_format_feature_row(X_display[i]),
                 "Anomaly" if preds[i] == -1 else "Normal",
                 round(float(scores[i]), 4),
             ]
-            for i in range(len(X_imp))
+            for i in range(len(X_display))
         ]
         labels_for_chart = [
             "Anomaly" if p == -1 else "Normal" for p in preds

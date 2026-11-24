@@ -3,7 +3,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.metrics import (
     accuracy_score,
@@ -17,12 +16,14 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC, SVR
 
 from app.services.ml_common import (
+    _build_feature_preprocessor,
     _compute_roc_details,
-    _extract_numeric_features,
+    _display_feature_values,
+    _extract_feature_frame,
+    _format_feature_row,
     _is_missing,
     _numeric_param,
     _project_2d,
@@ -50,11 +51,13 @@ def run_supervised(
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' was not found.")
 
-    X_raw = _extract_numeric_features(df, feature_columns)
+    X_raw, numeric_columns, categorical_columns = _extract_feature_frame(
+        df, feature_columns
+    )
     y_raw_series = df[target_column]
 
     valid_mask = ~_is_missing(y_raw_series)
-    X_valid = X_raw[valid_mask.to_numpy()]
+    X_valid = X_raw.loc[valid_mask].reset_index(drop=True)
     y_valid = y_raw_series.loc[valid_mask].reset_index(drop=True)
 
     if len(y_valid) < 5:
@@ -106,12 +109,6 @@ def run_supervised(
         raise ValueError(
             "The training split must contain every class. Add rows or increase the test split."
         )
-
-    prep_steps: list[tuple[str, Any]] = [
-        ("imputer", SimpleImputer(strategy="median"))
-    ]
-    if scale_features:
-        prep_steps.append(("scaler", StandardScaler()))
 
     if algorithm == "logistic_regression":
         c_val = float(_numeric_param(params, "C", 1.0))
@@ -185,12 +182,25 @@ def run_supervised(
     else:
         raise ValueError(f"Unsupported supervised algorithm: {algorithm}")
 
-    pipeline = Pipeline(prep_steps + [("estimator", model)])
+    preprocessor = _build_feature_preprocessor(
+        numeric_columns, categorical_columns, scale_features
+    )
+    pipeline = Pipeline(
+        [("preprocessor", preprocessor), ("estimator", model)]
+    )
     pipeline.fit(X_train, y_train)
     test_preds = pipeline.predict(X_test)
     all_preds = pipeline.predict(X_valid)
 
-    X_clean_display = Pipeline(prep_steps).fit_transform(X_valid)
+    X_processed = pipeline.named_steps["preprocessor"].transform(X_valid)
+    X_clean_display = _display_feature_values(
+        X_valid,
+        pipeline.named_steps["preprocessor"],
+        feature_columns,
+        numeric_columns,
+        categorical_columns,
+        scale_numeric=scale_features,
+    )
     extra_chart_series: dict[str, Any] = {}
 
     if resolved_task == "classification":
@@ -250,14 +260,14 @@ def run_supervised(
         table_rows = [
             [
                 i + 1,
-                *[round(float(v), 4) for v in X_clean_display[i]],
+                *_format_feature_row(X_clean_display[i]),
                 fmt_cls(int(y_arr[i])),
                 fmt_cls(int(all_preds_int[i])),
             ]
             for i in range(len(X_valid))
         ]
         chart_points = _project_2d(
-            X_clean_display, [f"Pred {fmt_cls(int(p))}" for p in all_preds_int]
+            X_processed, [f"Pred {fmt_cls(int(p))}" for p in all_preds_int]
         )
     else:
         metrics = {
@@ -281,7 +291,7 @@ def run_supervised(
         table_rows = [
             [
                 i + 1,
-                *[round(float(v), 4) for v in X_clean_display[i]],
+                *_format_feature_row(X_clean_display[i]),
                 round(float(y_arr[i]), 4),
                 round(float(all_preds[i]), 4),
                 round(float(y_arr[i] - all_preds[i]), 4),
@@ -289,7 +299,7 @@ def run_supervised(
             for i in range(len(X_valid))
         ]
         chart_points = _project_2d(
-            X_clean_display,
+            X_processed,
             ["Rows"] * len(y_arr),
         )
 
